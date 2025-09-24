@@ -2,7 +2,7 @@ import multiprocessing
 import time
 import sys
 import os
-from typing import Set, Tuple
+from typing import Set, Tuple, Optional
 
 import redis
 
@@ -11,26 +11,74 @@ REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 UPPER_LIMIT = 1_000_000
 CHUNK_SIZE = 10_000
 
+REDIS_RETRIES = int(os.environ.get("REDIS_RETRIES", "5"))
+REDIS_RETRY_DELAY = float(os.environ.get("REDIS_RETRY_DELAY", "0.5"))
 
-def collatz_cached(start_number: int, redis_client: redis.Redis) -> bool:
+
+def make_redis_client(host: str, port: int, retries: int = REDIS_RETRIES, delay: float = REDIS_RETRY_DELAY) -> Optional[
+    redis.Redis]:
+    for attempt in range(1, retries + 1):
+        try:
+            client = redis.Redis(
+                host=host,
+                port=port,
+                socket_timeout=5,
+                socket_connect_timeout=5,
+                socket_keepalive=True,
+                health_check_interval=30,
+                retry_on_timeout=True,
+                decode_responses=False,
+            )
+            client.ping()
+            return client
+        except redis.exceptions.RedisError:
+            if attempt == retries:
+                break
+            time.sleep(delay)
+    return None
+
+
+def collatz_cached(start_number: int, redis_client: Optional[redis.Redis]) -> bool:
     number = start_number
     path: Set[int] = set()
 
+    def safe_exists(key: str) -> Optional[bool]:
+        if redis_client is None:
+            return None
+        for attempt in range(REDIS_RETRIES):
+            try:
+                return bool(redis_client.exists(key))
+            except redis.exceptions.RedisError:
+                if attempt == REDIS_RETRIES - 1:
+                    return None
+                time.sleep(REDIS_RETRY_DELAY)
+        return None
+
+    def safe_set_many(keys: Set[int]) -> None:
+        if redis_client is None or not keys:
+            return
+        for attempt in range(REDIS_RETRIES):
+            try:
+                pipe = redis_client.pipeline()
+                for n in keys:
+                    pipe.set(f"collatz_ok:{n}", 1)
+                pipe.execute()
+                return
+            except redis.exceptions.RedisError:
+                if attempt == REDIS_RETRIES - 1:
+                    return
+                time.sleep(REDIS_RETRY_DELAY)
+
     while True:
-        if redis_client.exists(f"collatz_ok:{number}"):
-            pipe = redis_client.pipeline()
-            for n in path:
-                pipe.set(f"collatz_ok:{n}", 1)
-            pipe.execute()
+        exists = safe_exists(f"collatz_ok:{number}")
+        if exists:
+            safe_set_many(path)
             return True
 
         path.add(number)
 
         if number == 1:
-            pipe = redis_client.pipeline()
-            for n in path:
-                pipe.set(f"collatz_ok:{n}", 1)
-            pipe.execute()
+            safe_set_many(path)
             return True
 
         if number % 2 == 0:
@@ -43,16 +91,14 @@ def collatz_cached(start_number: int, redis_client: redis.Redis) -> bool:
 
 
 def worker(
-    tasks_queue: multiprocessing.Queue,
-    results_queue: multiprocessing.Queue,
-    stop_event: multiprocessing.Event,
-    redis_host: str,
-    redis_port: int,
+        tasks_queue: multiprocessing.Queue,
+        results_queue: multiprocessing.Queue,
+        stop_event: multiprocessing.Event,
+        redis_host: str,
+        redis_port: int,
 ) -> None:
-    try:
-        redis_client = redis.Redis(host=redis_host, port=redis_port)
-        redis_client.ping()
-    except redis.exceptions.ConnectionError:
+    redis_client = make_redis_client(redis_host, redis_port)
+    if redis_client is None:
         print(f"The process {multiprocessing.current_process().name} was unable to connect to Redis.")
         return
 
@@ -144,4 +190,5 @@ def print_results(results_q: multiprocessing.Queue, elapsed_time: float) -> None
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()
